@@ -52,9 +52,9 @@ function onOpen() {
 // ── 2. onEdit trigger – auto-fill when a row is completed ─
 /**
  * onEdit(e) runs automatically every time a cell is edited.
- * It checks if the edited row has Dish Name, Ingredient Name, AND
- * Quantity filled in, but nutrition columns are still empty.
- * If so, it fetches and fills nutrition for just that row.
+ * It checks if the edited row has Ingredient Name (B) AND Quantity (C)
+ * filled in, but the Calories column (D) is still empty.
+ * Dish Name (A) is optional — you can fill it manually at any time.
  */
 function onEdit(e) {
   var sheet = e.range.getSheet();
@@ -67,13 +67,13 @@ function onEdit(e) {
   // Ignore the header row
   if (row < DATA_START_ROW) return;
 
-  var dishName   = sheet.getRange(row, COL_DISH).getValue();
   var ingredient = sheet.getRange(row, COL_INGREDIENT).getValue();
   var quantity   = sheet.getRange(row, COL_QUANTITY).getValue();
   var calories   = sheet.getRange(row, COL_CALORIES).getValue();
 
-  // Only proceed if A, B, C are filled AND D (calories) is still empty
-  if (dishName && ingredient && quantity && !calories) {
+  // Trigger as soon as B and C are filled and D is still empty
+  // Dish Name (column A) is not required — fill it manually whenever you like
+  if (ingredient && quantity && !calories) {
     fillRowNutrition(sheet, row, false);
     buildSummarySheet(); // Rebuild summary after each new entry
   }
@@ -98,13 +98,12 @@ function fillMissingNutrition() {
   var filledCount = 0;
 
   for (var row = DATA_START_ROW; row <= lastRow; row++) {
-    var dish       = sheet.getRange(row, COL_DISH).getValue();
     var ingredient = sheet.getRange(row, COL_INGREDIENT).getValue();
     var quantity   = sheet.getRange(row, COL_QUANTITY).getValue();
     var calories   = sheet.getRange(row, COL_CALORIES).getValue();
 
-    // Skip rows that are incomplete or already have data
-    if (!dish || !ingredient || !quantity) continue;
+    // Skip rows missing ingredient or quantity, or rows that already have data
+    if (!ingredient || !quantity) continue;
     if (calories !== "" && calories !== null) continue;
 
     var filled = fillRowNutrition(sheet, row, false);
@@ -137,11 +136,11 @@ function refreshAllNutrition() {
   var filledCount = 0;
 
   for (var row = DATA_START_ROW; row <= lastRow; row++) {
-    var dish       = sheet.getRange(row, COL_DISH).getValue();
     var ingredient = sheet.getRange(row, COL_INGREDIENT).getValue();
     var quantity   = sheet.getRange(row, COL_QUANTITY).getValue();
 
-    if (!dish || !ingredient || !quantity) continue;
+    // Dish Name (column A) is not required for nutrition lookup
+    if (!ingredient || !quantity) continue;
 
     var filled = fillRowNutrition(sheet, row, true); // true = overwrite
     if (filled) filledCount++;
@@ -249,7 +248,7 @@ function fetchNutrition(ingredientName) {
     var data = JSON.parse(response.getContentText());
 
     // Walk through the returned products and find the first one
-    // that has all four nutritional fields populated
+    // that has usable nutritional data
     if (data && data.products && data.products.length > 0) {
       for (var i = 0; i < data.products.length; i++) {
         var product    = data.products[i];
@@ -257,14 +256,31 @@ function fetchNutrition(ingredientName) {
 
         if (!nutriments) continue;
 
-        // Open Food Facts uses these standard field names (per 100g)
-        var cal     = nutriments["energy-kcal_100g"];
-        var protein = nutriments["proteins_100g"];
-        var carbs   = nutriments["carbohydrates_100g"];
-        var fat     = nutriments["fat_100g"];
+        // ── Calories: try multiple field names Open Food Facts uses ──
+        // "energy-kcal_100g" is the preferred field but is often absent.
+        // Fall back to "energy-kcal" (without suffix), then convert from
+        // kJ ("energy_100g" / 4.184) as a last resort.
+        var cal = nutriments["energy-kcal_100g"];
+        if (cal == null) cal = nutriments["energy-kcal"];
+        if (cal == null && nutriments["energy_100g"] != null) {
+          cal = parseFloat(nutriments["energy_100g"]) / 4.184; // kJ → kcal
+        }
+        if (cal == null && nutriments["energy-kj_100g"] != null) {
+          cal = parseFloat(nutriments["energy-kj_100g"]) / 4.184;
+        }
 
-        // Accept this product only if at least calories and one macro are present
-        if (cal != null && (protein != null || carbs != null || fat != null)) {
+        // ── Macros: each also has a fallback without the _100g suffix ──
+        var protein = nutriments["proteins_100g"];
+        if (protein == null) protein = nutriments["proteins"];
+
+        var carbs = nutriments["carbohydrates_100g"];
+        if (carbs == null) carbs = nutriments["carbohydrates"];
+
+        var fat = nutriments["fat_100g"];
+        if (fat == null) fat = nutriments["fat"];
+
+        // Accept this product if we have at least a calorie value
+        if (cal != null) {
           return {
             calories: parseFloat(cal)     || 0,
             protein:  parseFloat(protein) || 0,
