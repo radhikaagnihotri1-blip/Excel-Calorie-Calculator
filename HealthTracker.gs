@@ -3,11 +3,14 @@
  * Health Tracker - Google Apps Script
  * ============================================================
  * This script auto-fills nutritional data (calories, protein,
- * carbs, fat) for each ingredient using the Open Food Facts API,
- * and maintains a per-dish summary sheet.
+ * carbs, fat) for each ingredient using the USDA FoodData Central
+ * API, and maintains a per-dish summary sheet.
+ *
+ * USDA FoodData Central is a free, authoritative US government
+ * nutrition database. A free API key is required — see below.
  *
  * Sheet columns expected in "Ingredients" sheet:
- *   A: Dish Name
+ *   A: Dish Name      ← enter manually, optional for nutrition lookup
  *   B: Ingredient Name
  *   C: Quantity (grams)
  *   D: Calories       ← auto-filled
@@ -32,6 +35,11 @@ var COL_FAT        = 7;  // G
 
 var NOT_FOUND_COLOR = "#FFFF00"; // Yellow highlight for missing data
 var FOUND_COLOR     = "#FFFFFF"; // White (clear highlight) for found data
+
+// ── USDA API Key ───────────────────────────────────────────
+// Get your FREE key in ~1 minute at: https://fdc.nal.usda.gov/api-key-signup
+// Paste it between the quotes below, then save the script.
+var USDA_API_KEY = "PASTE_YOUR_KEY_HERE";
 
 
 // ── 1. Add a custom menu when the spreadsheet opens ───────
@@ -211,87 +219,100 @@ function fillRowNutrition(sheet, row, overwrite) {
 }
 
 
-// ── 6. Open Food Facts API call ───────────────────────────
+// ── 6. USDA FoodData Central API call ────────────────────
 /**
  * fetchNutrition(ingredientName)
  *
- * Searches the Open Food Facts API for the given ingredient name.
+ * Searches the USDA FoodData Central API for the given ingredient.
  * Returns an object { calories, protein, carbs, fat } per 100g,
- * or null if nothing useful is found.
+ * or null if nothing is found.
  *
- * API docs: https://world.openfoodfacts.org/data
- * No API key is required – it is completely free and open.
+ * API docs: https://fdc.nal.usda.gov/api-guide.html
+ * Free key signup: https://fdc.nal.usda.gov/api-key-signup
  *
- * @param  {string} ingredientName - e.g. "onion"
+ * We search "Foundation" and "SR Legacy" data types first — these are
+ * the most reliable entries for basic raw ingredients (onion, tomato,
+ * chicken breast, rice, etc.). Branded products are excluded because
+ * they often have incomplete data.
+ *
+ * USDA nutrient IDs used:
+ *   1008 = Energy (kcal)
+ *   1003 = Protein
+ *   1005 = Carbohydrate, by difference
+ *   1004 = Total lipid (fat)
+ *
+ * @param  {string} ingredientName - e.g. "onion" or "basmati rice"
  * @returns {object|null}
  */
 function fetchNutrition(ingredientName) {
   try {
-    // Build the search URL. We ask for 5 results and pick the best one.
+    if (USDA_API_KEY === "PASTE_YOUR_KEY_HERE" || !USDA_API_KEY) {
+      Logger.log("USDA API key not set. Please add your key to the USDA_API_KEY variable.");
+      return null;
+    }
+
     var encodedName = encodeURIComponent(ingredientName);
-    var url = "https://world.openfoodfacts.org/cgi/search.pl"
-            + "?search_terms=" + encodedName
-            + "&search_simple=1"
-            + "&action=process"
-            + "&json=1"
-            + "&page_size=5"
-            + "&fields=product_name,nutriments";
+
+    // Search Foundation + SR Legacy data types — most reliable for raw ingredients.
+    // pageSize=5 gives us a few candidates to pick the best one from.
+    var url = "https://api.nal.usda.gov/fdc/v1/foods/search"
+            + "?query="    + encodedName
+            + "&dataType=Foundation,SR%20Legacy"
+            + "&pageSize=5"
+            + "&api_key="  + USDA_API_KEY;
 
     var response = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
 
-    // If the API call itself failed, return null
     if (response.getResponseCode() !== 200) {
-      Logger.log("API error for: " + ingredientName + " | HTTP " + response.getResponseCode());
+      Logger.log("USDA API error for '" + ingredientName + "' | HTTP " + response.getResponseCode());
       return null;
     }
 
     var data = JSON.parse(response.getContentText());
 
-    // Walk through the returned products and find the first one
-    // that has usable nutritional data
-    if (data && data.products && data.products.length > 0) {
-      for (var i = 0; i < data.products.length; i++) {
-        var product    = data.products[i];
-        var nutriments = product.nutriments;
-
-        if (!nutriments) continue;
-
-        // ── Calories: try multiple field names Open Food Facts uses ──
-        // "energy-kcal_100g" is the preferred field but is often absent.
-        // Fall back to "energy-kcal" (without suffix), then convert from
-        // kJ ("energy_100g" / 4.184) as a last resort.
-        var cal = nutriments["energy-kcal_100g"];
-        if (cal == null) cal = nutriments["energy-kcal"];
-        if (cal == null && nutriments["energy_100g"] != null) {
-          cal = parseFloat(nutriments["energy_100g"]) / 4.184; // kJ → kcal
-        }
-        if (cal == null && nutriments["energy-kj_100g"] != null) {
-          cal = parseFloat(nutriments["energy-kj_100g"]) / 4.184;
-        }
-
-        // ── Macros: each also has a fallback without the _100g suffix ──
-        var protein = nutriments["proteins_100g"];
-        if (protein == null) protein = nutriments["proteins"];
-
-        var carbs = nutriments["carbohydrates_100g"];
-        if (carbs == null) carbs = nutriments["carbohydrates"];
-
-        var fat = nutriments["fat_100g"];
-        if (fat == null) fat = nutriments["fat"];
-
-        // Accept this product if we have at least a calorie value
-        if (cal != null) {
-          return {
-            calories: parseFloat(cal)     || 0,
-            protein:  parseFloat(protein) || 0,
-            carbs:    parseFloat(carbs)   || 0,
-            fat:      parseFloat(fat)     || 0
-          };
-        }
-      }
+    // If Foundation/SR Legacy returned nothing, fall back to all data types
+    // (this catches packaged ingredients that only exist as branded products)
+    if (!data.foods || data.foods.length === 0) {
+      url = "https://api.nal.usda.gov/fdc/v1/foods/search"
+          + "?query="   + encodedName
+          + "&pageSize=5"
+          + "&api_key=" + USDA_API_KEY;
+      response = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+      if (response.getResponseCode() !== 200) return null;
+      data = JSON.parse(response.getContentText());
     }
 
-    // No suitable product found
+    if (!data.foods || data.foods.length === 0) return null;
+
+    // Walk through results and return the first one that has calorie data
+    for (var i = 0; i < data.foods.length; i++) {
+      var food      = data.foods[i];
+      var nutrients = food.foodNutrients;
+
+      if (!nutrients || nutrients.length === 0) continue;
+
+      // Build a quick lookup map: nutrientId → value
+      var lookup = {};
+      for (var j = 0; j < nutrients.length; j++) {
+        var n = nutrients[j];
+        // USDA returns nutrientId either directly or nested under .nutrientId
+        var id  = n.nutrientId || (n.nutrient && n.nutrient.id);
+        var val = n.value      || n.amount || 0;
+        if (id) lookup[id] = parseFloat(val) || 0;
+      }
+
+      var calories = lookup[1008]; // Energy (kcal)
+      if (!calories) continue;    // Skip products with no calorie entry
+
+      return {
+        calories: calories,
+        protein:  lookup[1003] || 0,  // Protein
+        carbs:    lookup[1005] || 0,  // Carbohydrate
+        fat:      lookup[1004] || 0   // Total fat
+      };
+    }
+
+    // No usable result found
     return null;
 
   } catch (err) {
